@@ -17,7 +17,7 @@ async function bootstrap() {
 
   // CORS
   const frontendUrl =
-    config.get<string>('frontend.url') ?? 'http://localhost:5173';
+    config.get<string>('https://aattral-v1-frontend-g5nx.vercel.app/') ?? 'http://localhost:5173';
   app.enableCors({
     origin: frontendUrl,
     credentials: true,
