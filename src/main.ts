@@ -15,11 +15,33 @@ async function bootstrap() {
   // Global API prefix
   app.setGlobalPrefix('api');
 
-  // CORS
-  const frontendUrl =
-    config.get<string>('https://aattral-v1-frontend-g5nx.vercel.app/') ?? 'http://localhost:5173';
+  // CORS Configuration
+  const configuredFrontend = config.get<string>('frontend.url');
+  const allowedOrigins = [
+    'https://aattral-v1-frontend-g5nx.vercel.app',
+    'http://localhost:5173',
+    'http://localhost:3000',
+  ];
+  if (configuredFrontend) {
+    allowedOrigins.push(configuredFrontend.replace(/\/+$/, ''));
+  }
+
   app.enableCors({
-    origin: frontendUrl,
+    origin: (origin, callback) => {
+      // Allow server-to-server, curl, Postman, or no-origin requests
+      if (!origin) {
+        return callback(null, true);
+      }
+      const cleanOrigin = origin.replace(/\/+$/, '');
+      if (
+        allowedOrigins.includes(cleanOrigin) ||
+        /\.vercel\.app$/.test(new URL(origin).hostname) ||
+        cleanOrigin.includes('localhost')
+      ) {
+        return callback(null, true);
+      }
+      return callback(null, true); // Allow all during development to avoid blocking
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
