@@ -35,8 +35,43 @@ export class ChatService {
     return title.length > 35 ? title.slice(0, 35) + '...' : title || 'New Conversation';
   }
 
+  /**
+   * Decides whether to run a web search for this query.
+   * Rules:
+   *  - ALWAYS search for web_search and deep_research modes
+   *  - For chat mode: search when question asks about current events, problems,
+   *    news, prices, weather, government policies, or real-world situations
+   */
+  private shouldSearch(prompt: string, mode: string): boolean {
+    if (mode === 'web_search' || mode === 'deep_research') return true;
+
+    const p = prompt.toLowerCase();
+
+    // Questions that need current real-world information
+    const needsCurrentInfo = p.match(
+      /issue|problem|challenge|today|current|now|recent|latest|news|price|cost|rate|weather|season|update|status|report|2024|2025|2026|government|scheme|policy|law|regulation|affect|impact|crisis|shortage|shortage|outbreak|war|conflict|disaster/,
+    );
+
+    // Questions about real-world situations or broad topics (e.g. "About agriculture")
+    const isRealWorldQuestion = p.match(
+      /about|what.*happen|how.*deal|why.*happen|farmer|agriculture|health|disease|economy|market|environment|climate|education|science|india|tamil/,
+    );
+
+    // Programming/technical questions don't need web search
+    const isTechnicalQuery = p.match(
+      /^(write|create|build|fix|debug|code for|refactor)\b/,
+    );
+
+    if (isTechnicalQuery && !isRealWorldQuestion) return false;
+
+    return !!(needsCurrentInfo || isRealWorldQuestion);
+  }
+
+  // ── Non-streaming message processor ────────────────────────────────────────
+
   async processMessage(userId: string | undefined, dto: SendMessageDto) {
-    const userObjectId = userId && Types.ObjectId.isValid(userId) ? new Types.ObjectId(userId) : undefined;
+    const userObjectId = userId && Types.ObjectId.isValid(userId)
+      ? new Types.ObjectId(userId) : undefined;
     const mode = dto.mode || 'chat';
     const industry = dto.industry || 'General';
 
@@ -45,7 +80,6 @@ export class ChatService {
     if (dto.conversationId && Types.ObjectId.isValid(dto.conversationId)) {
       conv = await this.convModel.findById(dto.conversationId).exec();
     }
-
     if (!conv) {
       conv = new this.convModel({
         userId: userObjectId,
@@ -67,21 +101,24 @@ export class ChatService {
     });
     await userMsg.save();
 
-    // 3. Web Search if mode is web_search or deep_research
+    // 3. Auto web search — runs for web_search, deep_research, AND relevant chat queries
+    const useWebSearch = this.shouldSearch(dto.prompt, mode);
     let sources: SearchResult[] = [];
-    if (mode === 'web_search' || mode === 'deep_research') {
+    if (useWebSearch) {
       try {
-        sources = await this.searchService.searchWeb(dto.prompt, mode === 'deep_research' ? 6 : 4);
+        const limit = mode === 'deep_research' ? 6 : 5;
+        sources = await this.searchService.searchWeb(dto.prompt, limit);
+        this.logger.log(`Auto-search: found ${sources.length} sources for "${dto.prompt}"`);
       } catch (err) {
         this.logger.warn(`Web search failed: ${err.message}`);
       }
     }
 
-    // 4. Retrieve conversation history for context (last 8 messages)
+    // 4. Retrieve conversation history (last 10 messages for context)
     const historyDocs = await this.messageModel
       .find({ conversationId: conv._id })
       .sort({ createdAt: 1 })
-      .limit(8)
+      .limit(10)
       .exec();
 
     const conversationHistory = historyDocs.map((m) => ({
@@ -96,6 +133,7 @@ export class ChatService {
       industry,
       conversationHistory,
       sources,
+      useWebSearch,
     });
 
     // 6. Save assistant message
@@ -110,7 +148,7 @@ export class ChatService {
     });
     await assistantMsg.save();
 
-    // 7. Update conversation updatedAt timestamp
+    // 7. Update conversation timestamp
     conv.updatedAt = new Date();
     await conv.save();
 
@@ -121,8 +159,11 @@ export class ChatService {
     };
   }
 
+  // ── Streaming message processor ─────────────────────────────────────────────
+
   async *streamMessage(userId: string | undefined, dto: SendMessageDto) {
-    const userObjectId = userId && Types.ObjectId.isValid(userId) ? new Types.ObjectId(userId) : undefined;
+    const userObjectId = userId && Types.ObjectId.isValid(userId)
+      ? new Types.ObjectId(userId) : undefined;
     const mode = dto.mode || 'chat';
     const industry = dto.industry || 'General';
 
@@ -131,7 +172,6 @@ export class ChatService {
     if (dto.conversationId && Types.ObjectId.isValid(dto.conversationId)) {
       conv = await this.convModel.findById(dto.conversationId).exec();
     }
-
     if (!conv) {
       conv = new this.convModel({
         userId: userObjectId,
@@ -142,7 +182,7 @@ export class ChatService {
       await conv.save();
     }
 
-    // Yield conversation metadata first
+    // Yield conversation metadata
     yield {
       type: 'meta',
       conversationId: conv._id.toString(),
@@ -160,22 +200,21 @@ export class ChatService {
     });
     await userMsg.save();
 
-    yield {
-      type: 'user_message',
-      userMessage: userMsg,
-    };
+    yield { type: 'user_message', userMessage: userMsg };
 
-    // 3. Search sources if needed
+    // 3. Auto web search — runs automatically when query needs current info
+    const useWebSearch = this.shouldSearch(dto.prompt, mode);
     let sources: SearchResult[] = [];
-    if (mode === 'web_search' || mode === 'deep_research') {
+    if (useWebSearch) {
       try {
-        sources = await this.searchService.searchWeb(dto.prompt, mode === 'deep_research' ? 6 : 4);
-        yield {
-          type: 'sources',
-          sources,
-        };
+        const limit = mode === 'deep_research' ? 6 : 5;
+        sources = await this.searchService.searchWeb(dto.prompt, limit);
+        this.logger.log(`Auto-search (stream): found ${sources.length} sources for "${dto.prompt}"`);
+        if (sources.length > 0) {
+          yield { type: 'sources', sources };
+        }
       } catch (err) {
-        this.logger.warn(`Search failed in stream: ${err.message}`);
+        this.logger.warn(`Stream search failed: ${err.message}`);
       }
     }
 
@@ -183,7 +222,7 @@ export class ChatService {
     const historyDocs = await this.messageModel
       .find({ conversationId: conv._id })
       .sort({ createdAt: 1 })
-      .limit(8)
+      .limit(10)
       .exec();
 
     const conversationHistory = historyDocs.map((m) => ({
@@ -193,20 +232,16 @@ export class ChatService {
 
     // 5. Stream from AI service
     let fullText = '';
-    const chunkGenerator = this.aiService.streamResponse({
+    for await (const chunk of this.aiService.streamResponse({
       prompt: dto.prompt,
       mode,
       industry,
       conversationHistory,
       sources,
-    });
-
-    for await (const chunk of chunkGenerator) {
+      useWebSearch,
+    })) {
       fullText += chunk;
-      yield {
-        type: 'chunk',
-        chunk,
-      };
+      yield { type: 'chunk', chunk };
     }
 
     // 6. Save assistant message after streaming completes
@@ -231,6 +266,8 @@ export class ChatService {
     };
   }
 
+  // ── Feedback ─────────────────────────────────────────────────────────────────
+
   async updateFeedback(messageId: string, feedback: 'like' | 'dislike') {
     if (!Types.ObjectId.isValid(messageId)) {
       throw new NotFoundException('Message not found');
@@ -240,10 +277,7 @@ export class ChatService {
       { feedback },
       { new: true },
     ).exec();
-
-    if (!msg) {
-      throw new NotFoundException('Message not found');
-    }
+    if (!msg) throw new NotFoundException('Message not found');
     return msg;
   }
 }

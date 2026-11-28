@@ -15,48 +15,135 @@ export class SearchService {
 
   constructor(private readonly config: ConfigService) {}
 
+  /**
+   * Extract concise search keywords from a natural-language question
+   */
+  private extractKeywords(query: string): string {
+    const stopWords = new Set([
+      'what', 'which', 'who', 'whom', 'whose', 'where', 'when', 'why', 'how',
+      'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am',
+      'do', 'does', 'did', 'doing', 'have', 'has', 'had',
+      'can', 'could', 'will', 'would', 'shall', 'should', 'may', 'might', 'must',
+      'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from',
+      'about', 'nowadays', 'currently', 'today', 'please', 'give', 'me', 'tell',
+      'explain', 'describe', 'list', 'some', 'any', 'facing', 'face',
+    ]);
+
+    const words = query
+      .replace(/[^\w\s-]/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length > 1 && !stopWords.has(w.toLowerCase()));
+
+    return words.length > 0 ? words.join(' ') : query.trim();
+  }
+
   async searchWeb(query: string, limit = 5): Promise<SearchResult[]> {
     const cleanQuery = query.trim();
     if (!cleanQuery) return [];
 
-    // 1. Try DuckDuckGo Instant Answer API
-    try {
-      const ddgResults = await this.searchDuckDuckGo(cleanQuery, limit);
-      if (ddgResults && ddgResults.length > 0) {
-        this.logger.log(`DuckDuckGo returned ${ddgResults.length} results for: "${cleanQuery}"`);
-        return ddgResults;
+    const keywords = this.extractKeywords(cleanQuery);
+    const results: SearchResult[] = [];
+    const seenUrls = new Set<string>();
+
+    const addUnique = (items: SearchResult[]) => {
+      for (const item of items) {
+        if (!item.url || seenUrls.has(item.url)) continue;
+        seenUrls.add(item.url);
+        results.push(item);
+        if (results.length >= limit) break;
       }
-    } catch (err) {
-      this.logger.warn(`DuckDuckGo search failed: ${err.message}`);
+    };
+
+    // Run Google News RSS, Wikipedia full-text search, and DuckDuckGo in parallel
+    const [newsRes, wikiRes, ddgRes] = await Promise.allSettled([
+      this.searchGoogleNewsRss(keywords, Math.min(3, limit)),
+      this.searchWikipediaQuery(keywords, Math.min(3, limit)),
+      this.searchDuckDuckGo(keywords, Math.min(2, limit)),
+    ]);
+
+    if (newsRes.status === 'fulfilled' && newsRes.value.length > 0) {
+      addUnique(newsRes.value);
+    }
+    if (results.length < limit && wikiRes.status === 'fulfilled' && wikiRes.value.length > 0) {
+      addUnique(wikiRes.value);
+    }
+    if (results.length < limit && ddgRes.status === 'fulfilled' && ddgRes.value.length > 0) {
+      addUnique(ddgRes.value);
     }
 
-    // 2. Try Wikipedia OpenSearch
-    try {
-      const wikiResults = await this.searchWikipedia(cleanQuery, limit);
-      if (wikiResults && wikiResults.length > 0) {
-        this.logger.log(`Wikipedia returned ${wikiResults.length} results for: "${cleanQuery}"`);
-        return wikiResults;
-      }
-    } catch (err) {
-      this.logger.warn(`Wikipedia search failed: ${err.message}`);
+    if (results.length > 0) {
+      this.logger.log(`Search returned ${results.length} live results for "${keywords}"`);
+      return results.slice(0, limit);
     }
 
-    // 3. Topic-aware curated sources as last resort
+    // Last resort: topic-aware authoritative sources
     return this.getCuratedSources(cleanQuery);
+  }
+
+  private async searchGoogleNewsRss(query: string, limit: number): Promise<SearchResult[]> {
+    const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-IN&gl=IN&ceid=IN:en`;
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Aattral-AI/2.0' },
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!res.ok) return [];
+
+    const xml = await res.text();
+    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, limit);
+    const results: SearchResult[] = [];
+
+    for (const match of items) {
+      const block = match[1];
+      const titleRaw = block.match(/<title>([\s\S]*?)<\/title>/)?.[1] || '';
+      const linkRaw = block.match(/<link>([\s\S]*?)<\/link>/)?.[1] || '';
+      const pubDateRaw = block.match(/<pubDate>([\s\S]*?)<\/pubDate>/)?.[1] || '';
+      const sourceRaw = block.match(/<source[^>]*>([\s\S]*?)<\/source>/)?.[1] || '';
+
+      const title = this.decodeXml(titleRaw).trim();
+      const link = linkRaw.trim();
+      const source = this.decodeXml(sourceRaw).trim();
+
+      if (title && link) {
+        results.push({
+          title,
+          url: link,
+          snippet: source ? `Published by ${source}${pubDateRaw ? ` (${pubDateRaw.slice(0, 16)})` : ''}.` : title,
+          siteName: source || 'news.google.com',
+          publishedDate: pubDateRaw ? pubDateRaw.slice(0, 16) : undefined,
+        });
+      }
+    }
+
+    return results;
+  }
+
+  private async searchWikipediaQuery(query: string, limit: number): Promise<SearchResult[]> {
+    const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=${limit}&format=json&origin=*`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+    if (!res.ok) return [];
+
+    const data: any = await res.json();
+    const items = data.query?.search || [];
+    return items.map((item: any) => ({
+      title: item.title,
+      url: `https://en.wikipedia.org/wiki/${encodeURIComponent(item.title.replace(/ /g, '_'))}`,
+      snippet: (item.snippet || '').replace(/<[^>]+>/g, '').trim(),
+      siteName: 'wikipedia.org',
+      publishedDate: item.timestamp ? item.timestamp.slice(0, 10) : undefined,
+    }));
   }
 
   private async searchDuckDuckGo(query: string, limit: number): Promise<SearchResult[]> {
     const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
     const res = await fetch(url, {
       headers: { 'User-Agent': 'Aattral-AI/2.0 (aattral.ai)' },
-      signal: AbortSignal.timeout(7000),
+      signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) return [];
 
     const data: any = await res.json();
     const results: SearchResult[] = [];
 
-    // Main abstract
     if (data.AbstractText && data.AbstractURL) {
       results.push({
         title: data.Heading || query,
@@ -66,24 +153,10 @@ export class SearchService {
       });
     }
 
-    // Related topics
     if (Array.isArray(data.RelatedTopics)) {
       for (const item of data.RelatedTopics) {
         if (results.length >= limit) break;
-        // Handle nested topics
-        if (item.Topics && Array.isArray(item.Topics)) {
-          for (const sub of item.Topics) {
-            if (results.length >= limit) break;
-            if (sub.Text && sub.FirstURL) {
-              results.push({
-                title: sub.Text.split(' - ')[0]?.slice(0, 80) || sub.Text.slice(0, 80),
-                url: sub.FirstURL,
-                snippet: sub.Text,
-                siteName: this.extractDomain(sub.FirstURL),
-              });
-            }
-          }
-        } else if (item.Text && item.FirstURL) {
+        if (item.Text && item.FirstURL) {
           results.push({
             title: item.Text.split(' - ')[0]?.slice(0, 80) || item.Text.slice(0, 80),
             url: item.FirstURL,
@@ -94,42 +167,7 @@ export class SearchService {
       }
     }
 
-    // Instant Answers
-    if (data.Answer && results.length < limit) {
-      results.push({
-        title: `Quick Answer: ${query}`,
-        url: data.AnswerURL || `https://duckduckgo.com/?q=${encodeURIComponent(query)}`,
-        snippet: String(data.Answer),
-        siteName: 'duckduckgo.com',
-      });
-    }
-
     return results.slice(0, limit);
-  }
-
-  private async searchWikipedia(query: string, limit: number): Promise<SearchResult[]> {
-    // Use Wikipedia's search API for better results
-    const searchUrl = `https://en.wikipedia.org/w/api.php?action=opensearch&search=${encodeURIComponent(query)}&limit=${limit}&namespace=0&format=json&origin=*`;
-    const res = await fetch(searchUrl, { signal: AbortSignal.timeout(6000) });
-    if (!res.ok) return [];
-
-    const data: any = await res.json();
-    const titles: string[] = data[1] || [];
-    const snippets: string[] = data[2] || [];
-    const urls: string[] = data[3] || [];
-
-    const results: SearchResult[] = [];
-    for (let i = 0; i < titles.length; i++) {
-      if (urls[i]) {
-        results.push({
-          title: titles[i],
-          url: urls[i],
-          snippet: snippets[i] || `Wikipedia article about ${titles[i]}.`,
-          siteName: 'wikipedia.org',
-        });
-      }
-    }
-    return results;
   }
 
   private getCuratedSources(query: string): SearchResult[] {
@@ -137,23 +175,7 @@ export class SearchService {
     const encoded = encodeURIComponent(query);
     const sources: SearchResult[] = [];
 
-    // Always add Wikipedia and Scholar as universal fallbacks
-    sources.push({
-      title: `${query} — Wikipedia`,
-      url: `https://en.wikipedia.org/wiki/Special:Search?search=${encoded}`,
-      snippet: `Comprehensive overview and factual information about ${query} from Wikipedia.`,
-      siteName: 'wikipedia.org',
-    });
-
-    sources.push({
-      title: `${query} — Google Scholar`,
-      url: `https://scholar.google.com/scholar?q=${encoded}`,
-      snippet: `Peer-reviewed academic research, papers and citations related to ${query}.`,
-      siteName: 'scholar.google.com',
-    });
-
-    // Topic-specific authoritative sources
-    if (q.match(/agri|farm|crop|soil|seed|harvest|pesticide|fertilizer|irrigation|cattle|livestock|agriculture/)) {
+    if (q.match(/agri|farm|crop|soil|seed|harvest|pesticide|fertilizer|irrigation|cattle|livestock|kisan|farmer/)) {
       sources.push(
         {
           title: 'FAO — Food and Agriculture Organization',
@@ -162,138 +184,38 @@ export class SearchService {
           siteName: 'fao.org',
         },
         {
-          title: 'USDA Agricultural Research',
-          url: `https://www.ars.usda.gov/research/publications/?oc=main&search=${encoded}`,
-          snippet: 'United States Department of Agriculture research on crop science and farming.',
-          siteName: 'ars.usda.gov',
+          title: 'ICAR — Indian Council of Agricultural Research',
+          url: 'https://icar.org.in',
+          snippet: 'Apex body for coordinating, guiding and managing agricultural research and education in India.',
+          siteName: 'icar.org.in',
         },
         {
-          title: 'Agriculture.com — Farming News',
-          url: `https://www.agriculture.com/search?q=${encoded}`,
-          snippet: 'Latest farming news, crop prices, weather, and agricultural market updates.',
-          siteName: 'agriculture.com',
-        },
-      );
-    } else if (q.match(/health|medical|medicine|hospital|disease|symptom|treatment|doctor|vaccine|pharma/)) {
-      sources.push(
-        {
-          title: 'WHO — World Health Organization',
-          url: `https://www.who.int/search?indexCatalogue=genericsearchindex1&searchQuery=${encoded}`,
-          snippet: 'Global health data, disease reports, and healthcare guidelines from the WHO.',
-          siteName: 'who.int',
-        },
-        {
-          title: 'NIH — National Institutes of Health',
-          url: `https://search.nih.gov/search?affiliate=nih&query=${encoded}`,
-          snippet: 'Biomedical research, clinical trials, and medical publications from the NIH.',
-          siteName: 'nih.gov',
-        },
-        {
-          title: 'PubMed — Medical Research Articles',
-          url: `https://pubmed.ncbi.nlm.nih.gov/?term=${encoded}`,
-          snippet: 'Peer-reviewed biomedical literature and medical research articles.',
-          siteName: 'pubmed.ncbi.nlm.nih.gov',
-        },
-      );
-    } else if (q.match(/code|program|software|javascript|python|api|algorithm|html|css|react|node|developer/)) {
-      sources.push(
-        {
-          title: 'MDN Web Docs',
-          url: `https://developer.mozilla.org/en-US/search?q=${encoded}`,
-          snippet: 'Authoritative web technology documentation for HTML, CSS, JavaScript and APIs.',
-          siteName: 'developer.mozilla.org',
-        },
-        {
-          title: 'Stack Overflow — Developer Q&A',
-          url: `https://stackoverflow.com/search?q=${encoded}`,
-          snippet: 'Community answers for programming questions and software development issues.',
-          siteName: 'stackoverflow.com',
-        },
-        {
-          title: 'GitHub — Open Source Projects',
-          url: `https://github.com/search?q=${encoded}&type=repositories`,
-          snippet: 'Open source code, libraries, and repositories related to this technology.',
-          siteName: 'github.com',
-        },
-      );
-    } else if (q.match(/space|nasa|rocket|satellite|aerospace|aircraft|aviation|flight/)) {
-      sources.push(
-        {
-          title: 'NASA Official Research',
-          url: `https://www.nasa.gov/search/?q=${encoded}`,
-          snippet: 'Official NASA space missions, aeronautics research, and technology developments.',
-          siteName: 'nasa.gov',
-        },
-        {
-          title: 'ESA — European Space Agency',
-          url: `https://www.esa.int/search?q=${encoded}`,
-          snippet: 'European space exploration missions, satellite technology, and space science.',
-          siteName: 'esa.int',
-        },
-      );
-    } else if (q.match(/business|market|finance|invest|stock|economy|startup|revenue/)) {
-      sources.push(
-        {
-          title: 'Bloomberg — Business & Finance News',
-          url: `https://www.bloomberg.com/search?query=${encoded}`,
-          snippet: 'Real-time financial news, market data, and business intelligence.',
-          siteName: 'bloomberg.com',
-        },
-        {
-          title: 'Forbes — Business Insights',
-          url: `https://www.forbes.com/search/?q=${encoded}`,
-          snippet: 'Business strategy, entrepreneurship, and financial market analysis.',
-          siteName: 'forbes.com',
-        },
-      );
-    } else if (q.match(/climate|environment|pollution|renewable|energy|sustainability|carbon/)) {
-      sources.push(
-        {
-          title: 'IPCC — Climate Change Reports',
-          url: `https://www.ipcc.ch/search/?q=${encoded}`,
-          snippet: 'Intergovernmental Panel on Climate Change reports and scientific assessments.',
-          siteName: 'ipcc.ch',
-        },
-        {
-          title: 'IEA — International Energy Agency',
-          url: `https://www.iea.org/search?q=${encoded}`,
-          snippet: 'Global energy data, clean energy transitions, and sustainability reports.',
-          siteName: 'iea.org',
-        },
-      );
-    } else if (q.match(/education|school|university|student|learn|teach|curriculum/)) {
-      sources.push(
-        {
-          title: 'UNESCO — Education Resources',
-          url: `https://www.unesco.org/en/search?q=${encoded}`,
-          snippet: 'Global education data, policies, and research from UNESCO.',
-          siteName: 'unesco.org',
-        },
-        {
-          title: 'Khan Academy — Free Learning',
-          url: `https://www.khanacademy.org/search?page_search_query=${encoded}`,
-          snippet: 'Free, world-class education resources for students at all levels.',
-          siteName: 'khanacademy.org',
-        },
-      );
-    } else if (q.match(/news|current|today|latest|recent|2024|2025/)) {
-      sources.push(
-        {
-          title: 'BBC News — World News',
-          url: `https://www.bbc.com/search?q=${encoded}`,
-          snippet: 'Latest world news, breaking stories, and analysis from the BBC.',
-          siteName: 'bbc.com',
-        },
-        {
-          title: 'Reuters — International News',
-          url: `https://www.reuters.com/search/news?blob=${encoded}`,
-          snippet: 'Real-time global news coverage and investigative reporting from Reuters.',
-          siteName: 'reuters.com',
+          title: 'Ministry of Agriculture & Farmers Welfare (India)',
+          url: 'https://agriwelfare.gov.in',
+          snippet: 'Official Government of India portal for farmer schemes (PM-KISAN, PMFBY, e-NAM) and crop data.',
+          siteName: 'agriwelfare.gov.in',
         },
       );
     }
 
+    sources.push({
+      title: `${query} — Wikipedia`,
+      url: `https://en.wikipedia.org/wiki/Special:Search?search=${encoded}`,
+      snippet: `Overview and references for ${query} on Wikipedia.`,
+      siteName: 'wikipedia.org',
+    });
+
     return sources.slice(0, 5);
+  }
+
+  private decodeXml(str: string): string {
+    return str
+      .replace(/<!\[CDATA\[|\]\]>/g, '')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'");
   }
 
   private extractDomain(url: string): string {
