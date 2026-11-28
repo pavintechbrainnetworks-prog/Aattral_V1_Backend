@@ -38,7 +38,7 @@ export class ChatService {
   async processMessage(userId: string | undefined, dto: SendMessageDto) {
     const userObjectId = userId && Types.ObjectId.isValid(userId) ? new Types.ObjectId(userId) : undefined;
     const mode = dto.mode || 'chat';
-    const industry = dto.industry || 'Aerospace';
+    const industry = dto.industry || 'General';
 
     // 1. Get or create conversation
     let conv: ConversationDocument | null = null;
@@ -124,7 +124,7 @@ export class ChatService {
   async *streamMessage(userId: string | undefined, dto: SendMessageDto) {
     const userObjectId = userId && Types.ObjectId.isValid(userId) ? new Types.ObjectId(userId) : undefined;
     const mode = dto.mode || 'chat';
-    const industry = dto.industry || 'Aerospace';
+    const industry = dto.industry || 'General';
 
     // 1. Get or create conversation
     let conv: ConversationDocument | null = null;
@@ -217,11 +217,7 @@ export class ChatService {
       text: fullText,
       mode,
       sources,
-      suggestedQuestions: [
-        `Tell me more about ${industry} advancements`,
-        `Can you provide practical implementation steps?`,
-        `What are the security considerations?`,
-      ],
+      suggestedQuestions: this.aiService.generateSuggestedQuestions(dto.prompt),
     });
     await assistantMsg.save();
 

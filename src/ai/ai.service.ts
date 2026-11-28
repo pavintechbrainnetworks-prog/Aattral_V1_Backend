@@ -1,6 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import OpenAI from 'openai';
 import { SearchResult } from '../search/search.service';
 
 export interface AiResponse {
@@ -12,25 +11,43 @@ export interface AiResponse {
 @Injectable()
 export class AiService {
   private readonly logger = new Logger(AiService.name);
-  private openaiClient: OpenAI | null = null;
-  private readonly defaultModel: string;
+  private openaiBaseUrl = 'https://api.openai.com/v1';
+  private openaiKey: string | null = null;
+  private openaiModel = 'gpt-4o-mini';
+
+  // Gemini (Google) support
+  private geminiKey: string | null = null;
+  private geminiModel = 'gemini-1.5-flash';
 
   constructor(private readonly config: ConfigService) {
-    const apiKey = this.config.get<string>('OPENAI_API_KEY');
-    this.defaultModel = this.config.get<string>('OPENAI_MODEL') || 'gpt-4o-mini';
+    // OpenAI
+    const oaKey = this.config.get<string>('OPENAI_API_KEY') || '';
+    const oaModel = this.config.get<string>('OPENAI_MODEL') || 'gpt-4o-mini';
+    if (oaKey && oaKey.startsWith('sk-') && !oaKey.includes('...') && oaKey.length > 20) {
+      this.openaiKey = oaKey;
+      // Fix invalid model names
+      this.openaiModel = ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo'].includes(oaModel)
+        ? oaModel
+        : 'gpt-4o-mini';
+      this.logger.log(`OpenAI client ready. Model: ${this.openaiModel}`);
+    } else {
+      this.logger.warn('OPENAI_API_KEY not set or invalid. Checking Gemini...');
+    }
 
-    if (apiKey && apiKey.startsWith('sk-') && !apiKey.includes('...')) {
-      try {
-        this.openaiClient = new OpenAI({ apiKey });
-      } catch (err) {
-        this.logger.warn(`Failed to initialize OpenAI client: ${err.message}`);
-      }
+    // Gemini fallback
+    const gmKey = this.config.get<string>('GEMINI_API_KEY') || '';
+    if (gmKey && gmKey.length > 10 && !gmKey.includes('...')) {
+      this.geminiKey = gmKey;
+      this.logger.log('Gemini AI client ready.');
+    }
+
+    if (!this.openaiKey && !this.geminiKey) {
+      this.logger.warn('No AI API keys configured. Using built-in knowledge engine.');
     }
   }
 
-  /**
-   * Main generation method for chat, web search, deep research, and image creation.
-   */
+  // ─── Main Entry Point ────────────────────────────────────────────────────────
+
   async generateResponse(params: {
     prompt: string;
     mode: string;
@@ -40,27 +57,36 @@ export class AiService {
   }): Promise<AiResponse> {
     const { prompt, mode, industry, conversationHistory = [], sources = [] } = params;
 
-    // Mode: Image Creation
     if (mode === 'create_image') {
       return this.handleImageGeneration(prompt);
     }
 
-    // Try OpenAI if client is configured
-    if (this.openaiClient) {
+    const systemPrompt = this.buildSystemPrompt(prompt, mode, industry, sources);
+
+    // Try OpenAI
+    if (this.openaiKey) {
       try {
-        return await this.callOpenAi(prompt, mode, industry, conversationHistory, sources);
+        return await this.callOpenAI(systemPrompt, prompt, conversationHistory);
       } catch (err) {
-        this.logger.warn(`OpenAI call failed (${err.message}). Using built-in Aattral intelligence engine.`);
+        this.logger.warn(`OpenAI failed: ${err.message}. Trying Gemini...`);
       }
     }
 
-    // High quality built-in generative engine
-    return this.generateFallbackResponse(prompt, mode, industry, sources);
+    // Try Gemini
+    if (this.geminiKey) {
+      try {
+        return await this.callGemini(systemPrompt, prompt, conversationHistory);
+      } catch (err) {
+        this.logger.warn(`Gemini failed: ${err.message}. Using built-in engine.`);
+      }
+    }
+
+    // Built-in fallback
+    return this.generateSmartFallback(prompt, mode, industry, sources);
   }
 
-  /**
-   * Stream response generator (yields string chunks for SSE)
-   */
+  // ─── Streaming ────────────────────────────────────────────────────────────────
+
   async *streamResponse(params: {
     prompt: string;
     mode: string;
@@ -76,274 +102,452 @@ export class AiService {
       return;
     }
 
-    if (this.openaiClient) {
+    const systemPrompt = this.buildSystemPrompt(prompt, mode, industry, sources);
+
+    // OpenAI streaming
+    if (this.openaiKey) {
       try {
-        const systemPrompt = this.buildSystemPrompt(mode, industry, sources);
-        const messages: any[] = [{ role: 'system', content: systemPrompt }];
-
-        // Add last 6 turns of history for context
-        const recentHistory = conversationHistory.slice(-6);
-        for (const msg of recentHistory) {
-          messages.push({
-            role: msg.sender === 'user' ? 'user' : 'assistant',
-            content: msg.text,
-          });
-        }
-        messages.push({ role: 'user', content: prompt });
-
-        const stream = await this.openaiClient.chat.completions.create({
-          model: this.defaultModel,
-          messages,
-          stream: true,
-          temperature: 0.7,
-        });
-
-        for await (const chunk of stream) {
-          const content = chunk.choices[0]?.delta?.content || '';
-          if (content) {
-            yield content;
-          }
-        }
+        yield* this.streamOpenAI(systemPrompt, prompt, conversationHistory);
         return;
       } catch (err) {
-        this.logger.warn(`OpenAI streaming failed: ${err.message}. Falling back to chunked stream.`);
+        this.logger.warn(`OpenAI stream failed: ${err.message}. Trying Gemini...`);
       }
     }
 
-    // Fallback stream: output well-structured markdown in natural chunks
-    const response = await this.generateFallbackResponse(prompt, mode, industry, sources);
+    // Gemini streaming
+    if (this.geminiKey) {
+      try {
+        yield* this.streamGemini(systemPrompt, prompt, conversationHistory);
+        return;
+      } catch (err) {
+        this.logger.warn(`Gemini stream failed: ${err.message}. Using fallback.`);
+      }
+    }
+
+    // Built-in fallback streamed in chunks
+    const response = this.generateSmartFallback(prompt, mode, industry, sources);
     const paragraphs = response.text.split('\n\n');
     for (const p of paragraphs) {
       yield p + '\n\n';
-      await new Promise((r) => setTimeout(r, 60));
+      await new Promise((r) => setTimeout(r, 50));
     }
   }
 
-  private async callOpenAi(
-    prompt: string,
+  // ─── System Prompt Builder (KEY FIX: topic-aware, never hardcoded) ────────────
+
+  private buildSystemPrompt(
+    userPrompt: string,
     mode: string,
     industry?: string,
-    history: Array<{ sender: string; text: string }> = [],
     sources: SearchResult[] = [],
-  ): Promise<AiResponse> {
-    const systemPrompt = this.buildSystemPrompt(mode, industry, sources);
-    const messages: any[] = [{ role: 'system', content: systemPrompt }];
+  ): string {
+    // Detect actual topic from the user's message — never force industry
+    const detectedTopic = this.detectTopic(userPrompt);
 
-    for (const msg of history.slice(-6)) {
-      messages.push({
-        role: msg.sender === 'user' ? 'user' : 'assistant',
-        content: msg.text,
-      });
-    }
-    messages.push({ role: 'user', content: prompt });
+    let system = `You are Aattral, a highly capable and accurate AI assistant created by Techbrain Networks.
 
-    const completion = await this.openaiClient!.chat.completions.create({
-      model: this.defaultModel,
-      messages,
-      temperature: 0.7,
-    });
+CRITICAL RULES:
+1. ALWAYS answer the user's EXACT question. If they ask about agriculture, answer about agriculture. If they ask about cooking, answer about cooking. NEVER switch topics.
+2. NEVER generate unrelated content. The detected topic of this question is: "${detectedTopic}".
+3. Format responses in clean Markdown: use headings (##, ###), bullet points, numbered lists, bold for key terms, tables when comparing, and code blocks for code.
+4. Keep responses natural and conversational — like ChatGPT. Do NOT force every answer into rigid templates.
+5. For simple questions: give a direct, concise answer.
+6. For complex questions: provide thorough explanations with examples.
+7. NEVER invent facts, URLs, or citations. If you don't know something, say so clearly.`;
 
-    const text = completion.choices[0]?.message?.content || 'No response generated.';
-    const suggestedQuestions = this.extractSuggestedQuestions(prompt, industry);
-
-    return { text, suggestedQuestions };
-  }
-
-  private buildSystemPrompt(mode: string, industry?: string, sources: SearchResult[] = []): string {
-    let base = `You are Aattral, an advanced, highly professional AI assistant developed by Techbrain Networks.
-Your responses must be exceptionally clear, well-structured, insightful, and formatted in clean GitHub-Flavored Markdown.
-Use clear headings (###), bullet points, numbered steps, bold text for key terms, and tables when comparing concepts.
-When writing code, always specify the language in triple backticks with syntax highlighting.
-Avoid single wall-of-text paragraphs. Provide thorough explanations with examples.`;
-
-    if (industry) {
-      base += `\nCurrent Industry Context: ${industry}. Incorporate industry-specific expertise, terminology, and standards when relevant.`;
+    if (industry && industry !== 'Aerospace' && industry !== 'General') {
+      system += `\n8. The user has selected "${industry}" as their industry context. Use this to make examples more relevant, but ONLY if the question is related to it. Do NOT force industry context onto unrelated topics.`;
     }
 
     if (mode === 'web_search') {
-      base += `\nMode: Web Search. The following real-time sources were retrieved:\n`;
-      sources.forEach((s, idx) => {
-        base += `[${idx + 1}] ${s.title}: ${s.snippet} (URL: ${s.url})\n`;
-      });
-      base += `Synthesize these sources. When making factual statements, cite them using [1], [2], etc., matching the provided sources. Do not invent facts.`;
+      system += `\n\n## Web Search Mode
+The following sources were retrieved from the web for the query "${userPrompt}":
+${sources.map((s, i) => `[${i + 1}] **${s.title}** — ${s.snippet}\nURL: ${s.url}`).join('\n\n')}
+
+INSTRUCTIONS:
+- Use these sources to answer the question accurately.
+- Cite sources using [1], [2] etc. when referencing their information.
+- If the sources don't fully answer the question, say what you do and don't know.
+- Do NOT invent information not present in the sources.`;
     } else if (mode === 'deep_research') {
-      base += `\nMode: Deep Research. Perform a comprehensive, multi-angle analytical breakdown:
-1. Executive Summary
-2. Core Architecture / Technological Fundamentals
-3. Real-world Implementations & Key Industry Case Studies
-4. Challenges, Bottlenecks & Risk Mitigation
-5. Future Roadmap & Strategic Recommendations`;
+      system += `\n\n## Deep Research Mode
+Provide a comprehensive, well-structured research report on: "${userPrompt}"
+Structure your response with:
+- **Executive Summary** (2-3 sentences)
+- **Background & Context** (what it is, why it matters)
+- **Key Facts & Current State** (data, statistics, recent developments)
+- **Challenges & Problems** (real issues, not generic)
+- **Solutions & Recommendations** (practical, specific)
+- **Sources** (from retrieved sources if available)
+
+${sources.length > 0 ? `Retrieved sources:\n${sources.map((s, i) => `[${i + 1}] ${s.title}: ${s.snippet} — ${s.url}`).join('\n')}` : ''}`;
     }
 
-    return base;
+    return system;
   }
 
-  private async handleImageGeneration(prompt: string): Promise<AiResponse> {
-    let imageUrl = '';
+  // ─── Topic Detection (prevents Aerospace/template bleed) ───────────────────
 
-    if (this.openaiClient) {
-      try {
-        const imageRes = await this.openaiClient.images.generate({
-          prompt,
-          n: 1,
-          size: '1024x1024',
-        });
-        imageUrl = imageRes.data?.[0]?.url || '';
-      } catch (err) {
-        this.logger.warn(`DALL-E image generation failed: ${err.message}`);
+  private detectTopic(prompt: string): string {
+    const p = prompt.toLowerCase();
+    if (p.match(/agri|farm|crop|soil|seed|harvest|pesticide|fertilizer|irrigation|cattle|livestock/))
+      return 'Agriculture';
+    if (p.match(/health|medical|medicine|hospital|disease|symptom|treatment|doctor|patient|drug|vaccine/))
+      return 'Healthcare';
+    if (p.match(/code|program|software|javascript|python|api|database|algorithm|html|css|react|node/))
+      return 'Technology / Programming';
+    if (p.match(/space|nasa|rocket|satellite|aerospac|aircraft|aviation|flight/))
+      return 'Aerospace';
+    if (p.match(/business|market|finance|invest|stock|economy|startup|revenue|sales/))
+      return 'Business & Finance';
+    if (p.match(/education|school|university|student|learn|teach|curriculum/))
+      return 'Education';
+    if (p.match(/science|physics|chemistry|biology|research|experiment/))
+      return 'Science';
+    if (p.match(/automotive|car|vehicle|engine|ev|electric vehicle/))
+      return 'Automotive';
+    return 'General Knowledge';
+  }
+
+  // ─── OpenAI Integration ─────────────────────────────────────────────────────
+
+  private async callOpenAI(
+    systemPrompt: string,
+    userPrompt: string,
+    history: Array<{ sender: string; text: string }>,
+  ): Promise<AiResponse> {
+    const messages: any[] = [{ role: 'system', content: systemPrompt }];
+    for (const msg of history.slice(-8)) {
+      messages.push({ role: msg.sender === 'user' ? 'user' : 'assistant', content: msg.text });
+    }
+    messages.push({ role: 'user', content: userPrompt });
+
+    const res = await fetch(`${this.openaiBaseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.openaiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ model: this.openaiModel, messages, temperature: 0.7, max_tokens: 2048 }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`OpenAI HTTP ${res.status}: ${err}`);
+    }
+
+    const data: any = await res.json();
+    const text = data.choices?.[0]?.message?.content || 'No response generated.';
+    return { text, suggestedQuestions: this.generateSuggestedQuestions(userPrompt) };
+  }
+
+  private async *streamOpenAI(
+    systemPrompt: string,
+    userPrompt: string,
+    history: Array<{ sender: string; text: string }>,
+  ): AsyncGenerator<string, void, unknown> {
+    const messages: any[] = [{ role: 'system', content: systemPrompt }];
+    for (const msg of history.slice(-8)) {
+      messages.push({ role: msg.sender === 'user' ? 'user' : 'assistant', content: msg.text });
+    }
+    messages.push({ role: 'user', content: userPrompt });
+
+    const res = await fetch(`${this.openaiBaseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.openaiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ model: this.openaiModel, messages, temperature: 0.7, max_tokens: 2048, stream: true }),
+      signal: AbortSignal.timeout(60000),
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`OpenAI HTTP ${res.status}: ${err}`);
+    }
+
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const lines = decoder.decode(value).split('\n');
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const raw = line.slice(6).trim();
+        if (raw === '[DONE]') return;
+        try {
+          const json = JSON.parse(raw);
+          const content = json.choices?.[0]?.delta?.content;
+          if (content) yield content;
+        } catch {
+          // skip malformed chunks
+        }
       }
     }
+  }
 
-    // High quality generated image fallback
-    if (!imageUrl) {
-      const cleanPrompt = encodeURIComponent(prompt.trim().slice(0, 100));
-      imageUrl = `https://image.pollinations.ai/prompt/${cleanPrompt}?width=1024&height=1024&nologo=true`;
+  // ─── Gemini Integration ──────────────────────────────────────────────────────
+
+  private async callGemini(
+    systemPrompt: string,
+    userPrompt: string,
+    history: Array<{ sender: string; text: string }>,
+  ): Promise<AiResponse> {
+    const contents: any[] = [];
+    for (const msg of history.slice(-8)) {
+      contents.push({ role: msg.sender === 'user' ? 'user' : 'model', parts: [{ text: msg.text }] });
+    }
+    contents.push({ role: 'user', parts: [{ text: userPrompt }] });
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.geminiModel}:generateContent?key=${this.geminiKey}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: systemPrompt }] },
+        contents,
+        generationConfig: { temperature: 0.7, maxOutputTokens: 2048 },
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Gemini HTTP ${res.status}: ${err}`);
     }
 
-    const text = `### 🎨 Image Generated for: "${prompt}"
+    const data: any = await res.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response generated.';
+    return { text, suggestedQuestions: this.generateSuggestedQuestions(userPrompt) };
+  }
 
-![Generated visual for ${prompt}](${imageUrl})
+  private async *streamGemini(
+    systemPrompt: string,
+    userPrompt: string,
+    history: Array<{ sender: string; text: string }>,
+  ): AsyncGenerator<string, void, unknown> {
+    const contents: any[] = [];
+    for (const msg of history.slice(-8)) {
+      contents.push({ role: msg.sender === 'user' ? 'user' : 'model', parts: [{ text: msg.text }] });
+    }
+    contents.push({ role: 'user', parts: [{ text: userPrompt }] });
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.geminiModel}:streamGenerateContent?alt=sse&key=${this.geminiKey}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: systemPrompt }] },
+        contents,
+        generationConfig: { temperature: 0.7, maxOutputTokens: 2048 },
+      }),
+      signal: AbortSignal.timeout(60000),
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Gemini HTTP ${res.status}: ${err}`);
+    }
+
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const lines = decoder.decode(value).split('\n');
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const raw = line.slice(6).trim();
+        if (!raw) continue;
+        try {
+          const json = JSON.parse(raw);
+          const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (text) yield text;
+        } catch {
+          // skip malformed
+        }
+      }
+    }
+  }
+
+  // ─── Image Generation ────────────────────────────────────────────────────────
+
+  private async handleImageGeneration(prompt: string): Promise<AiResponse> {
+    const cleanPrompt = encodeURIComponent(prompt.trim().slice(0, 200));
+    const seed = Math.floor(Math.random() * 999999);
+    const imageUrl = `https://image.pollinations.ai/prompt/${cleanPrompt}?width=1024&height=1024&nologo=true&seed=${seed}`;
+
+    const text = `### 🎨 Generated Image: "${prompt}"
+
+![${prompt}](${imageUrl})
 
 ---
-**Creative Prompt**: *${prompt}*  
-**Style**: High-resolution, cinematic conceptual design  
-**Options**: Right-click or long-press the image to save or copy it.`;
+**Prompt**: *${prompt}*  
+**Tip**: Right-click (or long-press on mobile) to save the image.`;
 
     return {
       text,
       suggestedQuestions: [
-        `Enhance this image with futuristic lighting`,
-        `Generate a variation with high-detail blueprint view`,
-        `Create a 3D isometric render version`,
+        `Generate a variation of this image in a different style`,
+        `Create a more detailed version of this image`,
+        `Generate a similar image with different colors`,
       ],
       imageUrl,
     };
   }
 
-  private generateFallbackResponse(
+  // ─── Smart Fallback Engine (topic-aware, NOT industry-forced) ──────────────
+
+  private generateSmartFallback(
     prompt: string,
     mode: string,
-    industry = 'Technology',
+    industry?: string,
     sources: SearchResult[] = [],
   ): AiResponse {
     const q = prompt.trim();
+    const topic = this.detectTopic(q);
     let text = '';
 
-    if (mode === 'deep_research') {
-      text = `### 🔬 Deep Research Analysis: ${q}
+    if (mode === 'web_search') {
+      const citedSources =
+        sources.length > 0
+          ? sources
+          : [
+              {
+                title: `${q} — Wikipedia`,
+                url: `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(q)}`,
+                snippet: `Comprehensive information about ${q} from Wikipedia.`,
+                siteName: 'wikipedia.org',
+              },
+              {
+                title: `${q} — Google Scholar`,
+                url: `https://scholar.google.com/scholar?q=${encodeURIComponent(q)}`,
+                snippet: `Academic research and peer-reviewed articles about ${q}.`,
+                siteName: 'scholar.google.com',
+              },
+            ];
 
-#### 1. Executive Summary
-The rapid evolution of **${industry}** is fundamentally driven by autonomous intelligence, real-time data orchestration, and next-generation systems architecture. Addressing "${q}" requires a strategic balance between immediate operational efficiency and long-term scalable architecture.
+      text = `## 🌐 Web Search: "${q}"
 
-#### 2. Technological Architecture & Core Foundations
-- **Automated Processing**: Leveraging decentralized computing and neural pipelines to reduce operational latency.
-- **Resilience & Fault Tolerance**: Implementing zero-downtime micro-architectures with automated failover protocols.
-- **Predictive Analytics**: Utilizing historical telemetry combined with real-time sensor streams to anticipate critical bottlenecks.
+Here is what was found about **${q}**:
 
-| Metric / Dimension | Traditional Paradigm | Modern Aattral ${industry} Standard |
-| :--- | :--- | :--- |
-| **Response Latency** | Minutes to Hours | Sub-second (< 250ms) |
-| **System Availability** | 99.5% | 99.999% Zero-Downtime |
-| **Scalability** | Vertical hardware scale | Distributed cloud-native scale |
-
-#### 3. Real-World Implementation & Case Studies
-1. **Adaptive Workflows**: Enterprises deploying integrated AI pipelines experience up to a 42% acceleration in development velocity.
-2. **Quality Control & Precision**: Continuous validation cycles ensure error reduction across high-stakes domains.
-
-#### 4. Challenges & Risk Mitigation
-- **Data Integrity & Security**: Implement end-to-end encryption, strict role-based access control (RBAC), and verifiable audit logs.
-- **Edge Deployment Constraints**: Optimize neural weights and leverage quantization to allow performant execution in bandwidth-constrained environments.
-
-#### 5. Strategic Roadmap
-- **Phase 1 (Immediate)**: Consolidate core data feeds and establish unified observability.
-- **Phase 2 (Medium Term)**: Integrate autonomous feedback loops and continuous model optimization.
-- **Phase 3 (Long Term)**: Transition to fully cognitive self-healing workflows.`;
-    } else if (mode === 'web_search') {
-      const citedSources = sources.length > 0 ? sources : [
-        {
-          title: `${q} - Official Technical Reference`,
-          url: `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(q)}`,
-          snippet: `Current comprehensive information and verified findings regarding ${q}.`,
-          siteName: 'wikipedia.org',
-        },
-      ];
-
-      text = `### 🌐 Web Search Findings for: "${q}"
-
-Based on the latest indexed knowledge and verified sources:
-
-- **Key Finding**: In-depth analysis of **${q}** highlights significant developments in technology, regulatory compliance, and cross-industry integration.
-- **Core Insights**: Multiple verified references confirm that modern systems are emphasizing security, efficiency, and automated operational pipelines.
-
-#### 📚 Cited Sources:
-${citedSources
-  .map(
-    (s, idx) =>
-      `[${idx + 1}] **[${s.title}](${s.url})**  \n*${s.snippet}* — \`${s.siteName || 'Web'}\``,
-  )
-  .join('\n\n')}
+${citedSources.map((s, i) => `### [${i + 1}] [${s.title}](${s.url})\n${s.snippet}\n*Source: ${s.siteName || 'Web'}*`).join('\n\n')}
 
 ---
-*Summary generated by Aattral Smart Web Search with verified source citations.*`;
+> ℹ️ For the most current and detailed information, please visit the sources above directly.`;
+    } else if (mode === 'deep_research') {
+      text = `## 🔬 Deep Research: "${q}"
+
+### Executive Summary
+This report provides a comprehensive analysis of **${q}** in the context of **${topic}**.
+
+### Background & Context
+${q} is an important topic in ${topic}. Understanding it requires examining its core principles, current developments, and practical implications.
+
+### Key Areas to Explore
+1. **Definition & Fundamentals** — What is ${q} and why does it matter?
+2. **Current State** — What is happening today in this area?
+3. **Challenges** — What are the main problems and obstacles?
+4. **Solutions & Best Practices** — How are these challenges being addressed?
+5. **Future Outlook** — Where is this heading?
+
+> ⚠️ **Note**: For the most accurate and up-to-date research on "${q}", please enable **Web Search** mode or visit reliable sources such as Wikipedia, Google Scholar, or domain-specific publications.
+
+${sources.length > 0 ? `### Sources\n${sources.map((s, i) => `[${i + 1}] [${s.title}](${s.url}) — ${s.snippet}`).join('\n')}` : ''}`;
     } else {
-      text = `### Overview: ${q}
+      // Smart conversational fallback based on detected topic
+      text = `## ${q}
 
-In the context of **${industry}**, here is a comprehensive breakdown:
+I'm Aattral, your AI assistant. Here's what I can tell you about **${q}** (${topic}):
 
-#### Key Takeaways
-1. **Core Concept**: **${q}** involves structured protocols designed to maximize performance, reliability, and precision.
-2. **Implementation Strategy**:
-   - Define clear domain constraints and data inputs.
-   - Establish continuous monitoring and validation metrics.
-   - Employ modular architectures to prevent single points of failure.
+This is a ${topic} question. To give you the most accurate and current answer, I'd recommend:
 
-#### Example Architecture / Code Snippet
-\`\`\`javascript
-// Example: Scalable workflow pattern in ${industry}
-async function processWorkflow(query) {
-  console.log("Analyzing query:", query);
-  const validated = await validateSystemState();
-  if (!validated.ok) throw new Error("Pre-flight validation failed");
-  
-  return {
-    status: "active",
-    industry: "${industry}",
-    timestamp: new Date().toISOString()
-  };
-}
-\`\`\`
+1. **Enable Web Search mode** — I'll search the internet and give you real, cited information about "${q}".
+2. **Enable Deep Research mode** — For a comprehensive, structured analysis.
 
-#### Next Steps
-- Review your current baseline metrics.
-- Formulate test cases under peak load conditions.`;
+### What I know about "${q}":
+${this.getTopicBasedHint(q, topic)}
+
+> 💡 **Tip**: For the best results with questions like this, click the **Web Search** button before sending your message. I'll retrieve current, verified information from reliable sources.`;
     }
 
     return {
       text,
-      suggestedQuestions: this.extractSuggestedQuestions(prompt, industry),
+      suggestedQuestions: this.generateSuggestedQuestions(prompt),
     };
   }
 
-  private extractSuggestedQuestions(prompt: string, industry = 'Aerospace'): string[] {
-    const q = prompt.toLowerCase();
-    if (q.includes('flight') || q.includes('space') || industry === 'Aerospace') {
-      return [
-        `How do autonomous aircraft achieve zero-downtime reliability?`,
-        `What are the latest satellite telemetry standards?`,
-        `Explain supersonic aerodynamics and fuel efficiency.`,
-      ];
+  private getTopicBasedHint(query: string, topic: string): string {
+    switch (topic) {
+      case 'Agriculture':
+        return `Agriculture involves farming, crop cultivation, livestock management, and food production. Common topics include soil health, crop diseases, irrigation methods, sustainable farming, pesticide use, and modern agricultural technology like precision farming and drones.`;
+      case 'Healthcare':
+        return `Healthcare encompasses medicine, patient care, disease prevention, and medical research. Topics include treatments, diagnostics, public health policies, pharmaceutical developments, and healthcare technology.`;
+      case 'Technology / Programming':
+        return `Technology and programming cover software development, computer science, web technologies, mobile apps, AI/ML, databases, and digital systems. Happy to explain code, debug problems, or explain technical concepts.`;
+      case 'Business & Finance':
+        return `Business and finance topics include entrepreneurship, investment, markets, accounting, strategy, economics, and financial planning.`;
+      case 'Education':
+        return `Education encompasses learning methods, curriculum design, school systems, educational technology, student development, and teaching practices.`;
+      case 'Science':
+        return `Science covers physics, chemistry, biology, environmental science, research methodology, and scientific discoveries.`;
+      case 'Aerospace':
+        return `Aerospace includes aircraft design, space exploration, satellite technology, aerodynamics, rocket propulsion, and aviation safety.`;
+      default:
+        return `I can help answer questions on a wide range of topics. For the most accurate current information on "${query}", please use Web Search mode.`;
     }
-    if (q.includes('health') || industry === 'Healthcare') {
-      return [
-        `What are the HIPAA compliance standards for AI in medicine?`,
-        `How is predictive modeling used in early disease detection?`,
-        `Explain the pipeline for clinical trial data analysis.`,
-      ];
+  }
+
+  // ─── Suggested Questions (topic-aware) ──────────────────────────────────────
+
+  generateSuggestedQuestions(prompt: string): string[] {
+    const topic = this.detectTopic(prompt);
+    const q = prompt.trim();
+
+    switch (topic) {
+      case 'Agriculture':
+        return [
+          `What are the most common crop diseases and how to treat them?`,
+          `How does precision farming technology improve yield?`,
+          `What are sustainable farming practices for small farmers?`,
+        ];
+      case 'Healthcare':
+        return [
+          `What are the latest treatments for this condition?`,
+          `How does preventive medicine reduce healthcare costs?`,
+          `What are the global health challenges in 2024?`,
+        ];
+      case 'Technology / Programming':
+        return [
+          `Can you give me a code example for this?`,
+          `What are the best practices for this technology?`,
+          `How does this compare to other alternatives?`,
+        ];
+      case 'Business & Finance':
+        return [
+          `What are the key market trends in this area?`,
+          `How can small businesses improve profitability?`,
+          `What financial metrics should I track?`,
+        ];
+      case 'Aerospace':
+        return [
+          `How do modern aircraft navigation systems work?`,
+          `What are the latest developments in space exploration?`,
+          `How is AI being used in aerospace engineering?`,
+        ];
+      default:
+        return [
+          `Can you explain this in more detail?`,
+          `What are the latest developments in this area?`,
+          `What are some practical examples?`,
+        ];
     }
-    return [
-      `Can you give a detailed technical example with code?`,
-      `What are the primary industry challenges and solutions?`,
-      `How does this compare to traditional architectures?`,
-    ];
   }
 }
