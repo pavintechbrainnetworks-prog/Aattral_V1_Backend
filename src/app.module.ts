@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Controller, Get, Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ThrottlerModule } from '@nestjs/throttler';
 import configuration from './config/configuration';
@@ -9,6 +9,14 @@ import { ConversationsModule } from './conversations/conversations.module';
 import { ChatModule } from './chat/chat.module';
 import { AiModule } from './ai/ai.module';
 import { SearchModule } from './search/search.module';
+
+@Controller('health')
+class HealthController {
+  @Get()
+  check() {
+    return { ok: true, timestamp: new Date().toISOString() };
+  }
+}
 
 @Module({
   imports: [
@@ -26,5 +34,6 @@ import { SearchModule } from './search/search.module';
     AiModule,
     SearchModule,
   ],
+  controllers: [HealthController],
 })
 export class AppModule {}

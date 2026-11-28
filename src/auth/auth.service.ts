@@ -71,11 +71,16 @@ export class AuthService {
     }
 
     const loginEntry = new Date().toISOString();
-    await this.usersService.addLoginHistory(String(user._id), loginEntry);
+    // Record login history in the background so login doesn't wait on extra DB round-trips
+    void this.usersService.addLoginHistory(String(user._id), loginEntry).catch((err) => {
+      console.warn('Failed to record login history:', err?.message || err);
+    });
 
-    const cleanUser = await this.usersService.findById(String(user._id));
+    const userObj = user.toObject ? user.toObject() : { ...user };
+    delete (userObj as any).password;
+
     const token = this.generateToken(user);
-    return { token, user: cleanUser };
+    return { token, user: userObj };
   }
 
   async sendOtp(dto: SendOtpDto) {

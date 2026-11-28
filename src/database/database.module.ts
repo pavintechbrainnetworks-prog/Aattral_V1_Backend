@@ -10,6 +10,11 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
       useFactory: (config: ConfigService) => ({
         uri: config.get<string>('mongodbUri') || 'mongodb://127.0.0.1:27017/aattral',
         autoIndex: true,
+        maxPoolSize: 10,
+        minPoolSize: 2,
+        serverSelectionTimeoutMS: 5000,
+        connectTimeoutMS: 10000,
+        socketTimeoutMS: 15000,
       }),
     }),
   ],
