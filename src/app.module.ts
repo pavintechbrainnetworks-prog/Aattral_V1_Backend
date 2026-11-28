@@ -14,6 +14,7 @@ import { SearchModule } from './search/search.module';
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
+      envFilePath: ['.env', '.env.local'],
       load: [configuration],
     }),
     ThrottlerModule.forRoot([{ ttl: 60000, limit: 60 }]),

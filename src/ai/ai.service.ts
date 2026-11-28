@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { GoogleGenAI } from '@google/genai';
 import { SearchResult } from '../search/search.service';
@@ -13,28 +13,49 @@ export interface AiResponse {
 }
 
 @Injectable()
-export class AiService {
+export class AiService implements OnModuleInit {
   private readonly logger = new Logger(AiService.name);
   private genAI: GoogleGenAI | null = null;
   private readonly geminiModel: string;
   private readonly hasApiKey: boolean;
 
   constructor(private readonly config: ConfigService) {
-    const apiKey = (this.config.get<string>('GEMINI_API_KEY') || '').trim();
-    this.geminiModel = (this.config.get<string>('GEMINI_MODEL') || 'gemini-flash-latest').trim();
+    const rawKey =
+      this.config.get<string>('gemini.apiKey') ||
+      this.config.get<string>('GEMINI_API_KEY') ||
+      process.env.GEMINI_API_KEY ||
+      '';
+    const apiKey = rawKey.trim().replace(/^["']|["']$/g, '');
+
+    const rawModel =
+      this.config.get<string>('gemini.model') ||
+      this.config.get<string>('GEMINI_MODEL') ||
+      process.env.GEMINI_MODEL ||
+      'gemini-flash-latest';
+    this.geminiModel = rawModel.trim().replace(/^["']|["']$/g, '') || 'gemini-flash-latest';
 
     if (apiKey && apiKey.length > 10 && !apiKey.includes('...')) {
       try {
         this.genAI = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: 'v1beta' } });
         this.hasApiKey = true;
-        this.logger.log(`Google Gemini (@google/genai) initialized. Model: ${this.geminiModel}`);
       } catch (err: any) {
         this.hasApiKey = false;
         this.logger.error(`Failed to initialize GoogleGenAI SDK: ${this.sanitizeError(err?.message)}`);
       }
     } else {
       this.hasApiKey = false;
-      this.logger.warn('GEMINI_API_KEY is not configured. Gemini API calls are disabled.');
+    }
+  }
+
+  onModuleInit() {
+    if (this.hasApiKey && this.genAI) {
+      this.logger.log(
+        `Startup Check: GEMINI_API_KEY is configured | Model: ${this.geminiModel}`,
+      );
+    } else {
+      this.logger.warn(
+        'Startup Check: GEMINI_API_KEY is missing or empty. Set GEMINI_API_KEY in .env (local) or Render Environment Variables (production).',
+      );
     }
   }
 
