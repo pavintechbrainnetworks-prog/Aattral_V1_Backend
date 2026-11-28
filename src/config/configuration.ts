@@ -9,6 +9,10 @@ export default () => ({
     url: process.env.FRONTEND_URL ?? 'http://localhost:5173',
   },
   bcryptRounds: parseInt(process.env.BCRYPT_ROUNDS ?? '10', 10) || 10,
+  gemini: {
+    apiKey: process.env.GEMINI_API_KEY ?? '',
+    model: process.env.GEMINI_MODEL ?? 'gemini-flash-latest',
+  },
   mail: {
     host: process.env.SMTP_HOST ?? 'smtp.gmail.com',
     port: parseInt(process.env.SMTP_PORT ?? '465', 10) || 465,

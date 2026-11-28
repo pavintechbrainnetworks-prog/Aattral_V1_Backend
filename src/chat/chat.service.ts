@@ -1,6 +1,7 @@
 import {
   Injectable,
   NotFoundException,
+  BadRequestException,
   Logger,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
@@ -70,6 +71,9 @@ export class ChatService {
   // ── Non-streaming message processor ────────────────────────────────────────
 
   async processMessage(userId: string | undefined, dto: SendMessageDto) {
+    if (!dto.prompt || !dto.prompt.trim()) {
+      throw new BadRequestException('Prompt cannot be empty');
+    }
     const userObjectId = userId && Types.ObjectId.isValid(userId)
       ? new Types.ObjectId(userId) : undefined;
     const mode = dto.mode || 'chat';
@@ -133,7 +137,6 @@ export class ChatService {
       industry,
       conversationHistory,
       sources,
-      useWebSearch,
     });
 
     // 6. Save assistant message
@@ -162,6 +165,9 @@ export class ChatService {
   // ── Streaming message processor ─────────────────────────────────────────────
 
   async *streamMessage(userId: string | undefined, dto: SendMessageDto) {
+    if (!dto.prompt || !dto.prompt.trim()) {
+      throw new BadRequestException('Prompt cannot be empty');
+    }
     const userObjectId = userId && Types.ObjectId.isValid(userId)
       ? new Types.ObjectId(userId) : undefined;
     const mode = dto.mode || 'chat';
@@ -238,7 +244,6 @@ export class ChatService {
       industry,
       conversationHistory,
       sources,
-      useWebSearch,
     })) {
       fullText += chunk;
       yield { type: 'chunk', chunk };
